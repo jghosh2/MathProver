@@ -19,14 +19,14 @@ The search runs in four stages:
 
   2. Lemma grounding. The model proposes Mathlib declaration names for the
      goal, and Lean `#check`s all of them in one compile. Names that do not
-     exist are recorded and excluded from every later prompt. Hallucinated
-     identifiers are the most common reason a generated proof fails, and they
-     are not self-correcting under retry.
+     exist are recorded and excluded from every later prompt, so the repair
+     loop does not spend attempts rediscovering them one at a time.
 
   3. Sampled generation. Each round requests several independent candidates in
      parallel via structured outputs, compiles them, and feeds the rejected
-     scripts back with Lean's diagnostics attached. Widening the sample count
-     helps more than lengthening the retry chain.
+     scripts back with Lean's diagnostics attached. Sampling explores distinct
+     proof strategies; the feedback loop refines a strategy that was nearly
+     right.
 
   4. Verification. Candidates using `sorry`, `admit`, `stop`, or
      `native_decide` are rejected before compiling, since Lean accepts them
@@ -64,16 +64,16 @@ MAX_HEARTBEATS = 1_000_000
 LADDER: tuple[str, ...] = (
     "rfl",
     "trivial",
-    "simp",
-    "norm_num",
-    "decide",
+    "ring",
     "omega",
+    "decide",
+    "norm_num",
+    "simp",
+    "simp_all",
     "positivity",
     "linarith",
     "nlinarith",
-    "ring",
     "tauto",
-    "simp_all",
     "aesop",
     "(constructor <;> simp_all)",
     "(field_simp; ring)",
@@ -86,7 +86,11 @@ _CHEATS = re.compile(r"(?<![\w.])(sorry|sorryAx|admit|native_decide|stop)(?![\w.
 _SAFE_AXIOMS = {"propext", "Classical.choice", "Quot.sound"}
 
 _ERROR_HEAD = re.compile(r"^(?:.*?:\d+:\d+:\s*)?(?:error|warning):", re.MULTILINE)
-_UNKNOWN_NAME = re.compile(r"unknown (?:identifier|constant)\s+'([^']+)'")
+# Lean quotes names with '...', `...` or Unicode quotes depending on version,
+# and capitalises the message in newer releases.
+_UNKNOWN_NAME = re.compile(
+    r"[Uu]nknown (?:identifier|constant)\s*[`'\u2018]([^`'\u2019]+)[`'\u2019]"
+)
 _DECL_NAME = re.compile(r"\b(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_.'!?₀-₉]*)")
 _LEAN_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_.'!?₀-₉]*$")
 
@@ -106,9 +110,37 @@ Rules:
 5. Prefer named `have` steps over one long tactic chain, so a single wrong step
    does not invalidate the whole proof.
 6. Indent with two spaces, consistently, starting at column 0 of the script.
+7. Prefer tactics whose syntax you are certain of. Some traps:
+   - `interval_cases x` takes the variable alone. Its `using` form needs TWO
+     bound hypotheses, `interval_cases using hlo, hhi`. When in doubt use
+     `rcases`, `match`, or `omega` instead.
+   - `simpa ... using h` fails on associativity and commutativity mismatches.
+     If the shapes differ only by rearrangement, close the step with `ring`,
+     `ring_nf`, or an explicit `mul_assoc` rewrite rather than `simpa`.
+   - `omega` rejects nonlinear terms. In an induction step over a polynomial,
+     use `linarith` (which treats `k^2`, `k^3` as atoms) or supply the witness
+     directly as `⟨w, by ring⟩`.
+   A parse error means the whole block never elaborated, so nothing after the
+   faulty line was checked.
 
 Put your reasoning in `thought_process`, never in `tactics_code`.\
 """
+
+# Sample-level strategy hints. Independent samples at a fixed prompt tend to
+# converge on one approach, which wastes the parallelism; assigning each
+# candidate a different route buys back the diversity.
+STRATEGIES: tuple[str, ...] = (
+    "",
+    "Use induction on the main variable. Close the base case with `simp` or "
+    "`decide`; in the step, obtain the witness from the inductive hypothesis "
+    "and finish with an explicit `⟨w, by ring⟩` or with `linarith`.",
+    "Avoid induction and avoid case analysis on remainders. Construct the "
+    "witness directly with `refine ⟨_, ?_⟩` and close the arithmetic by `ring`.",
+    "Look for an existing Mathlib lemma stating this fact or an equivalent "
+    "one, and apply it with `exact`, `apply`, or `simpa using`.",
+    "Use case analysis on the relevant residue or parity, via `rcases` or "
+    "`Nat.even_or_odd`. Do not use `interval_cases`.",
+)
 
 
 # --------------------------------------------------------------------------
@@ -137,6 +169,7 @@ class ProofResult:
     lean_result: LeanResult
     attempts: int
     source: Optional[str] = None  # the exact file Lean accepted
+    diagnostics: str = ""         # Lean's output, whichever stream it used
     found_by: str = ""
     thought_process: str = ""
     history: list[tuple[str, str]] = field(default_factory=list)
@@ -258,6 +291,25 @@ def _first_errors(text: str, count: int = 3, limit: int = 3000) -> str:
     return "\n".join(blocks)[:limit]
 
 
+def _library_names(output: str) -> set[str]:
+    """Extract missing *library* names from Lean's diagnostics.
+
+    Lean reports `unknown identifier` for local names too: when a candidate's
+    `obtain ⟨m, hm⟩ := ih` fails, the later use of `hm` raises the same error.
+    Banning `hm` would tell every later prompt that a local hypothesis name is
+    a nonexistent Mathlib lemma, which poisons the whole run.
+
+    A namespaced name, or a snake_case name with several underscores, is
+    library-shaped; short bare names are hypotheses. Missing a hallucinated
+    root-level lemma costs one wasted retry, so the filter errs that way.
+    """
+    found = set()
+    for name in _UNKNOWN_NAME.findall(output):
+        if "." in name or name.count("_") >= 2:
+            found.add(name)
+    return found
+
+
 def _run(source: str) -> Optional[LeanResult]:
     try:
         return check_lean(source)
@@ -290,8 +342,7 @@ def _verify(
         return False, None, f"Candidate rejected before compiling: uses `{cheat.group(1)}`."
 
     name = _theorem_name(statement)
-    trailer = f"#print axioms {name}" if name else ""
-    result = _run(_source(statement, tactics, trailer))
+    result = _run(_source(statement, tactics))
     if result is None:
         return False, None, "Lean did not return (timeout or toolchain error)."
 
@@ -299,18 +350,25 @@ def _verify(
     if not getattr(result, "certified", False):
         return False, result, output
 
-    if "sorryAx" in output or "Lean.ofReduceBool" in output:
-        return False, result, "Compiled, but depends on sorryAx / native_decide."
+    # The axioms check runs as a second compile, only once the proof itself has
+    # been accepted. Appending `#print axioms` to a failing candidate makes the
+    # parser report the trailer as the unexpected token, which sends the model
+    # chasing a line it never wrote.
+    if name:
+        checked = _run(_source(statement, tactics, f"#print axioms {name}"))
+        axiom_output = _diagnostics(checked) if checked else ""
 
-    # If the runner surfaces info output we can check the axiom list exactly.
-    axioms = re.search(r"depends on axioms:\s*\[([^\]]*)\]", output)
-    if axioms:
-        used = {a.strip() for a in axioms.group(1).split(",") if a.strip()}
-        extra = used - _SAFE_AXIOMS
-        if extra:
-            return False, result, f"Depends on unexpected axioms: {sorted(extra)}"
-        if verbose >= 2:
-            print(f"Axiom check passed: {sorted(used) or 'no axioms'}")
+        if "sorryAx" in axiom_output or "Lean.ofReduceBool" in axiom_output:
+            return False, result, "Compiled, but depends on sorryAx / native_decide."
+
+        axioms = re.search(r"depends on axioms:\s*\[([^\]]*)\]", axiom_output)
+        if axioms:
+            used = {a.strip() for a in axioms.group(1).split(",") if a.strip()}
+            extra = used - _SAFE_AXIOMS
+            if extra:
+                return False, result, f"Depends on unexpected axioms: {sorted(extra)}"
+            if verbose >= 2:
+                print(f"Axiom check passed: {sorted(used) or 'no axioms'}")
 
     return True, result, output
 
@@ -321,7 +379,14 @@ def _verify(
 
 
 def _ladder_body(tactics) -> str:
-    return "first\n" + "\n".join(f"| {t}" for t in tactics)
+    """Build a `first | ... | ...` block that backtracks on partial progress.
+
+    `first` commits to the first branch that does not throw, and a tactic like
+    `simp` can succeed while leaving goals open. Without the trailing `done`
+    the block would stop at that branch and the compile would fail with
+    `unsolved goals`, never reaching a later tactic that would have finished.
+    """
+    return "first\n" + "\n".join(f"| ({t}; done)" for t in tactics)
 
 
 def _try_tactics(statement: str, verbose: int) -> tuple[Optional[str], Optional[LeanResult]]:
@@ -416,8 +481,9 @@ def _ground_lemmas(
     verbose: int,
 ) -> tuple[list[str], list[str]]:
     """Ask the model which Mathlib lemmas it wants, then ask Lean which of them
-    exist. Hallucinated identifiers are the dominant failure mode, and retrying
-    alone never fixes them."""
+    exist. A name that does not exist yields the same `unknown identifier`
+    error on every retry, so catching these up front is cheaper than letting
+    the repair loop rediscover them one at a time."""
     user = (
         "List up to 12 Mathlib (Lean 4) declaration names likely useful for "
         "proving this theorem. Fully qualified names only.\n\n" + statement
@@ -440,9 +506,11 @@ def _ground_lemmas(
         return names, []
 
     output = _diagnostics(result)
-    missing = set(_UNKNOWN_NAME.findall(output))
+    # Only names we proposed can be missing here, so intersect rather than
+    # filtering by shape; root-level lemmas like `mul_comm` have no namespace.
+    missing = set(_UNKNOWN_NAME.findall(output)) & set(names)
     for name in names:  # any name named in an error line is suspect
-        if re.search(rf"error:[^\n]*{re.escape(name)}", output):
+        if re.search(rf"error:[^\n]*{re.escape(name)}", output, re.IGNORECASE):
             missing.add(name)
 
     real = [n for n in names if n not in missing]
@@ -499,21 +567,31 @@ def _sample(
     n: int,
     effort: Optional[str],
     max_workers: int,
+    diversify: bool = True,
 ) -> list[tuple[str, str]]:
-    """Return (tactics, thought_process) pairs. Independent samples in parallel
-    beat sequential repair for Lean, so this is where the search happens."""
+    """Return (tactics, thought_process) pairs.
 
-    def one() -> tuple[str, str]:
-        parsed = _ask(client, model, SYSTEM_PROMPT, user, LeanProofResponse, effort)
+    Each sample approaches the goal independently, so the set explores
+    different proof strategies rather than variations on one. Generation is
+    network-bound, so the calls overlap; compilation downstream is serial.
+    """
+
+    def one(index: int) -> tuple[str, str]:
+        prompt = user
+        if diversify and n > 1:
+            hint = STRATEGIES[index % len(STRATEGIES)]
+            if hint:
+                prompt = f"{user}\n\nFor this candidate specifically: {hint}"
+        parsed = _ask(client, model, SYSTEM_PROMPT, prompt, LeanProofResponse, effort)
         return _strip_preamble(parsed.tactics_code), parsed.thought_process
 
     if n == 1:
-        return [one()]
+        return [one(0)]
 
     results: list[tuple[str, str]] = []
     workers = max(1, min(n, max_workers))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(one) for _ in range(n)]
+        futures = [pool.submit(one, i) for i in range(n)]
         for future in concurrent.futures.as_completed(futures):
             try:
                 results.append(future.result())
@@ -537,6 +615,7 @@ def prove(
     reasoning_effort: Optional[str] = "high",
     try_tactics: bool = True,
     ground_lemmas: bool = True,
+    diversify: bool = True,
     max_workers: int = 4,
 ) -> ProofResult:
     """
@@ -549,12 +628,15 @@ def prove(
     verbose=1 prints progress, verbose=2 also prints candidates and diagnostics.
 
     Options:
-      samples_per_attempt  independent candidates per round. Parallel search
-                           beats sequential repair, so this matters more than
-                           max_attempts: 8 x 2 outperforms 1 x 16.
+      samples_per_attempt  independent candidates per round. Sampling explores
+                           different proof strategies; repair refines one. Both
+                           are useful and the right balance depends on the
+                           theorems, so benchmark before settling on a value.
       reasoning_effort     passed through when the model accepts it.
       try_tactics          run the standard tactic ladder before any API call.
       ground_lemmas        verify proposed lemma names against Mathlib first.
+      diversify            give each candidate in a round a different strategy
+                           hint, so the samples explore rather than converge.
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1.")
@@ -579,6 +661,7 @@ def prove(
                 lean_result=last_result,
                 attempts=0,
                 source=_source(statement, tactics),
+                diagnostics=_diagnostics(last_result) if last_result else "",
                 found_by="tactic-ladder",
                 thought_process="Closed by a standard Mathlib tactic.",
                 history=history,
@@ -606,7 +689,8 @@ def prove(
 
         user_prompt = _build_user_prompt(statement, history, known, banned)
         candidates = _sample(
-            client, model, user_prompt, samples_per_attempt, reasoning_effort, max_workers
+            client, model, user_prompt, samples_per_attempt,
+            reasoning_effort, max_workers, diversify,
         )
 
         fresh: list[tuple[str, str]] = []
@@ -644,13 +728,14 @@ def prove(
                     lean_result=last_result,
                     attempts=attempt,
                     source=_source(statement, tactics),
+                    diagnostics=output,
                     found_by=f"{model} (attempt {attempt}, candidate {index})",
                     thought_process=thought,
                     history=history,
                 )
 
             errors = _first_errors(output)
-            banned.update(_UNKNOWN_NAME.findall(output))
+            banned.update(_library_names(output))
             history.append((tactics, errors))
             if verbose >= 1:
                 print(f"[attempt {attempt}/{max_attempts}] Lean rejected candidate {index}.")
@@ -670,6 +755,7 @@ def prove(
         lean_result=last_result,
         attempts=attempts_used,
         source=None,
+        diagnostics=_diagnostics(last_result) if last_result else "",
         found_by="",
         thought_process="",
         history=history,
